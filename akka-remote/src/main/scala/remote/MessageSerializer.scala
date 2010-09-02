@@ -24,10 +24,10 @@ object MessageSerializer extends Logging {
     SERIALIZER_SBINARY.classLoader    = Some(cl)
   }
 
-  def deserialize(messageProtocol: MessageProtocol): Any = {
+  def deserialize(messageProtocol: MessageProtocol, classLoader: Option[ClassLoader] = None): Any = {
     messageProtocol.getSerializationScheme match {
       case SerializationSchemeType.JAVA =>
-        unbox(SERIALIZER_JAVA.fromBinary(messageProtocol.getMessage.toByteArray, None))
+        unbox(SERIALIZER_JAVA.fromBinary(messageProtocol.getMessage.toByteArray, None, classLoader))
       case SerializationSchemeType.PROTOBUF =>
         val clazz = loadManifest(SERIALIZER_PROTOBUF.classLoader, messageProtocol)
         SERIALIZER_PROTOBUF.fromBinary(messageProtocol.getMessage.toByteArray, Some(clazz))

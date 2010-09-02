@@ -71,6 +71,17 @@ message TypedActorInfoProtocol {
   required string method = 2;
 }
 
+message ClientToServerProtocol {
+  optional RemoteRequestProtocol remoteRequest = 1;
+  optional ClassResponseProtocol classResponse = 2;
+}
+
+message ServerToClientProtocol {
+  optional RemoteReplyProtocol remoteReply = 1;
+  optional ClassRequestProtocol classRequest = 2;
+}
+
+
 /**
  * Defines a remote message request.
  */
@@ -155,3 +166,20 @@ message ExceptionProtocol {
   required string classname  = 1;
   required string message = 2;
 }
+
+/**
+ * Request a class
+ */
+message ClassRequestProtocol {
+  required string classname = 1;
+}
+
+/**
+ * Reply with a class
+ */
+message ClassResponseProtocol {
+  required string classname = 1;
+  optional bool found = 2;
+  optional bytes clazz = 3;
+}
+

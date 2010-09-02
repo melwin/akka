@@ -22,7 +22,7 @@ trait Serializer {
   def deepClone(obj: AnyRef): AnyRef = fromBinary(toBinary(obj), Some(obj.getClass))
 
   def toBinary(obj: AnyRef): Array[Byte]
-  def fromBinary(bytes: Array[Byte], clazz: Option[Class[_]]): AnyRef
+  def fromBinary(bytes: Array[Byte], clazz: Option[Class[_]], classLoaderToUse: Option[ClassLoader] = None): AnyRef
 }
 
 // For Java API
@@ -44,7 +44,7 @@ object Serializer {
   object NOOP extends NOOP
   class NOOP extends Serializer {
     def toBinary(obj: AnyRef): Array[Byte] = Array[Byte]()
-    def fromBinary(bytes: Array[Byte], clazz: Option[Class[_]]): AnyRef = null.asInstanceOf[AnyRef]
+    def fromBinary(bytes: Array[Byte], clazz: Option[Class[_]], classLoaderToUse: Option[ClassLoader] = classLoader): AnyRef = null.asInstanceOf[AnyRef]
   }
 
   /**
@@ -60,9 +60,10 @@ object Serializer {
       bos.toByteArray
     }
 
-    def fromBinary(bytes: Array[Byte], clazz: Option[Class[_]]): AnyRef = {
+    def fromBinary(bytes: Array[Byte], clazz: Option[Class[_]], classLoaderToUse: Option[ClassLoader] = classLoader): AnyRef = {
+      val cl = if(classLoaderToUse.isDefined) classLoaderToUse else classLoader
       val in =
-        if (classLoader.isDefined) new ClassLoaderObjectInputStream(classLoader.get, new ByteArrayInputStream(bytes))
+        if (cl.isDefined) new ClassLoaderObjectInputStream(cl.get, new ByteArrayInputStream(bytes))
         else new ObjectInputStream(new ByteArrayInputStream(bytes))
       val obj = in.readObject
       in.close
@@ -81,7 +82,7 @@ object Serializer {
       obj.asInstanceOf[Message].toByteArray
     }
 
-    def fromBinary(bytes: Array[Byte], clazz: Option[Class[_]]): AnyRef = {
+    def fromBinary(bytes: Array[Byte], clazz: Option[Class[_]], classLoaderToUse: Option[ClassLoader] = classLoader): AnyRef = {
       if (!clazz.isDefined) throw new IllegalArgumentException(
         "Need a protobuf message class to be able to serialize bytes using protobuf")
       clazz.get.getDeclaredMethod("parseFrom", ARRAY_OF_BYTE_ARRAY: _*).invoke(null, bytes).asInstanceOf[Message]
@@ -108,18 +109,18 @@ object Serializer {
       bos.toByteArray
     }
 
-    def fromBinary(bytes: Array[Byte], clazz: Option[Class[_]]): AnyRef = {
+    def fromBinary(bytes: Array[Byte], clazz: Option[Class[_]], classLoaderToUse: Option[ClassLoader] = classLoader): AnyRef = {
       if (!clazz.isDefined) throw new IllegalArgumentException(
         "Can't deserialize JSON to instance if no class is provided")
       val in =
-        if (classLoader.isDefined) new ClassLoaderObjectInputStream(classLoader.get, new ByteArrayInputStream(bytes))
+        if (classLoaderToUse.isDefined) new ClassLoaderObjectInputStream(classLoaderToUse.get, new ByteArrayInputStream(bytes))
         else new ObjectInputStream(new ByteArrayInputStream(bytes))
       val obj = mapper.readValue(in, clazz.get).asInstanceOf[AnyRef]
       in.close
       obj
     }
 
-    def fromJSON(json: String, clazz: Class[_]): AnyRef = {
+    def fromJSON(json: String, clazz: Class[_], classLoaderToUse: Option[ClassLoader] = classLoader): AnyRef = {
       if (clazz eq null) throw new IllegalArgumentException("Can't deserialize JSON to instance if no class is provided")
       mapper.readValue(json, clazz).asInstanceOf[AnyRef]
     }
@@ -133,7 +134,7 @@ object Serializer {
     def toBinary(obj: AnyRef): Array[Byte] = SJSONSerializer.SJSON.out(obj)
 
     // FIXME set ClassLoader on SJSONSerializer.SJSON
-    def fromBinary(bytes: Array[Byte], clazz: Option[Class[_]]): AnyRef = SJSONSerializer.SJSON.in(bytes)
+    def fromBinary(bytes: Array[Byte], clazz: Option[Class[_]], classLoaderToUse: Option[ClassLoader] = classLoader): AnyRef = SJSONSerializer.SJSON.in(bytes)
 
     import scala.reflect.Manifest
     def fromJSON[T](json: String)(implicit m: Manifest[T]): AnyRef = {
@@ -160,7 +161,7 @@ object Serializer {
 
     def toBinary[T](t : T)(implicit bin : Writes[T]): Array[Byte] = toByteArray[T](t)
 
-    def fromBinary[T](array : Array[Byte], clazz: Option[Class[T]])(implicit bin : Reads[T]): T = fromByteArray[T](array)
+    def fromBinary[T](array : Array[Byte], clazz: Option[Class[T]], classLoaderToUse: Option[ClassLoader] = classLoader)(implicit bin : Reads[T]): T = fromByteArray[T](array)
   }
 }
 

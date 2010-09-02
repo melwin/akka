@@ -1,6 +1,7 @@
 package se.scalablesolutions.akka.actor.remote;
 
 import se.scalablesolutions.akka.actor.*;
+import se.scalablesolutions.akka.actor.remote.RemoteTypedActorLog;
 
 import java.util.concurrent.CountDownLatch;
 

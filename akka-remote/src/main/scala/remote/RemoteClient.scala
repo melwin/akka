@@ -27,9 +27,11 @@ import org.jboss.netty.handler.ssl.SslHandler
 import java.net.{SocketAddress, InetSocketAddress}
 import java.util.concurrent.{TimeUnit, Executors, ConcurrentMap, ConcurrentHashMap, ConcurrentSkipListSet}
 import java.util.concurrent.atomic.AtomicLong
+import java.io.ByteArrayOutputStream
 
 import scala.collection.mutable.{HashSet, HashMap}
 import scala.reflect.BeanProperty
+import com.google.protobuf.ByteString
 
 /**
  * Atomic remote request/reply message id generator.
@@ -272,15 +274,16 @@ class RemoteClient private[akka] (
     request: RemoteRequestProtocol,
     senderFuture: Option[CompletableFuture[T]]):
     Option[CompletableFuture[T]] = if (isRunning) {
+    val message = ClientToServerProtocol.newBuilder.setRemoteRequest(request).build
     if (request.getIsOneWay) {
-      connection.getChannel.write(request)
+      connection.getChannel.write(message)
       None
     } else {
       futures.synchronized {
         val futureResult = if (senderFuture.isDefined) senderFuture.get
         else new DefaultCompletableFuture[T](request.getActorInfo.getTimeout)
         futures.put(request.getId, futureResult)
-        connection.getChannel.write(request)
+        connection.getChannel.write(message)
         Some(futureResult)
       }
     }
@@ -343,7 +346,7 @@ class RemoteClientPipelineFactory(
     val timeout     = new ReadTimeoutHandler(timer, RemoteClient.READ_TIMEOUT.toMillis.toInt)
     val lenDec      = new LengthFieldBasedFrameDecoder(1048576, 0, 4, 0, 4)
     val lenPrep     = new LengthFieldPrepender(4)
-    val protobufDec = new ProtobufDecoder(RemoteReplyProtocol.getDefaultInstance)
+    val protobufDec = new ProtobufDecoder(ServerToClientProtocol.getDefaultInstance)
     val protobufEnc = new ProtobufEncoder
     val (enc, dec)  = RemoteServer.COMPRESSION_SCHEME match {
       case "zlib" => (join(new ZlibEncoder(RemoteServer.ZLIB_COMPRESSION_LEVEL)), join(new ZlibDecoder))
@@ -381,30 +384,51 @@ class RemoteClientHandler(
   override def messageReceived(ctx: ChannelHandlerContext, event: MessageEvent) {
     try {
       val result = event.getMessage
-      if (result.isInstanceOf[RemoteReplyProtocol]) {
-        val reply = result.asInstanceOf[RemoteReplyProtocol]
-        log.debug("Remote client received RemoteReplyProtocol[\n%s]", reply.toString)
-        val future = futures.get(reply.getId).asInstanceOf[CompletableFuture[Any]]
-        if (reply.getIsSuccessful) {
-          val message = MessageSerializer.deserialize(reply.getMessage)
-          future.completeWithResult(message)
-        } else {
-          if (reply.hasSupervisorUuid()) {
-            val supervisorUuid = reply.getSupervisorUuid
-            if (!supervisors.containsKey(supervisorUuid)) throw new IllegalActorStateException(
-              "Expected a registered supervisor for UUID [" + supervisorUuid + "] but none was found")
-            val supervisedActor = supervisors.get(supervisorUuid)
-            if (!supervisedActor.supervisor.isDefined) throw new IllegalActorStateException(
-              "Can't handle restart for remote actor " + supervisedActor + " since its supervisor has been removed")
-            else supervisedActor.supervisor.get ! Exit(supervisedActor, parseException(reply, client.loader))
+      
+      result match {
+        case message: ServerToClientProtocol if message.hasRemoteReply =>
+          val reply = message.getRemoteReply
+          log.debug("Remote client received RemoteReplyProtocol[\n%s]", reply.toString)
+          val future = futures.get(reply.getId).asInstanceOf[CompletableFuture[Any]]
+          if (reply.getIsSuccessful) {
+            val message = MessageSerializer.deserialize(reply.getMessage)
+            future.completeWithResult(message)
+          } else {
+            if (reply.hasSupervisorUuid()) {
+              val supervisorUuid = reply.getSupervisorUuid
+              if (!supervisors.containsKey(supervisorUuid)) throw new IllegalActorStateException(
+                "Expected a registered supervisor for UUID [" + supervisorUuid + "] but none was found")
+              val supervisedActor = supervisors.get(supervisorUuid)
+              if (!supervisedActor.supervisor.isDefined) throw new IllegalActorStateException(
+                "Can't handle restart for remote actor " + supervisedActor + " since its supervisor has been removed")
+              else supervisedActor.supervisor.get ! Exit(supervisedActor, parseException(reply, client.loader))
+            }
+            future.completeWithException(parseException(reply, client.loader))
           }
-          future.completeWithException(parseException(reply, client.loader))
-        }
-        futures.remove(reply.getId)
-      } else {
-        val exception = new RemoteClientException("Unknown message received in remote client handler: " + result, client)
-        client.foreachListener(_ ! RemoteClientError(exception, client))
-        throw exception
+          futures.remove(reply.getId)
+        case message: ServerToClientProtocol if message.hasClassRequest =>
+          val classRequest = message.getClassRequest
+          
+          log.debug("Request to get class %s", classRequest.getClassname)
+
+          val resp = ClassResponseProtocol.newBuilder
+              .setClassname(classRequest.getClassname)
+
+          val classBytes = classToBytes(classRequest.getClassname, this.getClass.getClassLoader)
+          if(classBytes.isDefined) {
+            resp.setClazz(ByteString.copyFrom(classBytes.get))
+            resp.setFound(true)
+          }
+          else resp.setFound(false)
+
+          log.debug("Writing class response.")
+          event.getChannel.write(ClientToServerProtocol.newBuilder.setClassResponse(resp).build)
+          log.debug("Class response written.")
+
+         case _ =>
+          val exception = new RemoteClientException("Unknown message received in remote client handler: " + result, client)
+          client.foreachListener(_ ! RemoteClientError(exception, client))
+          throw exception
       }
     } catch {
       case e: Exception =>
@@ -468,5 +492,33 @@ class RemoteClientHandler(
     exceptionClass
         .getConstructor(Array[Class[_]](classOf[String]): _*)
         .newInstance(exception.getMessage).asInstanceOf[Throwable]
+  }
+
+  private def classToBytes(className: String, classLoader: ClassLoader): Option[Array[Byte]] = {
+    val resource = className.replace('.','/') + ".class"
+
+    log.debug("Reading resource %s", resource)
+
+    val inputStream = classLoader.getResourceAsStream(resource)
+
+    if(inputStream == null) {
+      log.debug("Resource not found!")
+      return None
+    }
+
+    val outputStream = new ByteArrayOutputStream(1024)
+    val buffer = new Array[Byte](512)
+
+    try {
+      var readBytes = inputStream.read(buffer)
+      while(readBytes > 0) {
+        outputStream.write(buffer, 0, readBytes)
+        readBytes = inputStream.read(buffer)
+      }
+ 
+      return Some(outputStream.toByteArray())
+    } finally {
+      inputStream.close()
+    }
   }
 }

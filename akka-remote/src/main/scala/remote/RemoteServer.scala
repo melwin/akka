@@ -28,8 +28,10 @@ import org.jboss.netty.handler.codec.protobuf.{ProtobufDecoder, ProtobufEncoder}
 import org.jboss.netty.handler.codec.compression.{ZlibEncoder, ZlibDecoder}
 import org.jboss.netty.handler.ssl.SslHandler
 
-import scala.collection.mutable.Map
+import scala.collection.mutable.{Map,HashMap}
 import scala.reflect.BeanProperty
+import se.scalablesolutions.akka.dispatch.{CompletableFuture, Future, DefaultCompletableFuture}
+import java.nio.ByteBuffer
 
 /**
  * Use this object if you need a single remote server on a specific node.
@@ -207,6 +209,9 @@ class RemoteServer extends Logging with ListenerManagement {
   // group of open channels, used for clean-up
   private val openChannels: ChannelGroup = new DefaultChannelGroup("akka-remote-server")
 
+  //Cache for remotely loaded classes
+  private val classCache = new HashMap[String, Future[Class[_]]]()
+
   def isRunning = _isRunning
 
   def start: RemoteServer =
@@ -235,7 +240,7 @@ class RemoteServer extends Logging with ListenerManagement {
         log.info("Starting remote server at [%s:%s]", hostname, port)
         RemoteServer.register(hostname, port, this)
         val pipelineFactory = new RemoteServerPipelineFactory(
-          name, openChannels, loader, actors, typedActors, this)
+          name, openChannels, loader, classCache, actors, typedActors, this)
         bootstrap.setPipelineFactory(pipelineFactory)
         bootstrap.setOption("child.tcpNoDelay", true)
         bootstrap.setOption("child.keepAlive", true)
@@ -354,6 +359,7 @@ class RemoteServerPipelineFactory(
     val name: String,
     val openChannels: ChannelGroup,
     val loader: Option[ClassLoader],
+    val classCache: Map[String, Future[Class[_]]],
     val actors: (() => ConcurrentHashMap[String, ActorRef]),
     val typedActors: (() => ConcurrentHashMap[String, AnyRef]),
     val server: RemoteServer) extends ChannelPipelineFactory {
@@ -372,14 +378,14 @@ class RemoteServerPipelineFactory(
     val ssl         = if(RemoteServer.SECURE) join(new SslHandler(engine)) else join()
     val lenDec      = new LengthFieldBasedFrameDecoder(1048576, 0, 4, 0, 4)
     val lenPrep     = new LengthFieldPrepender(4)
-    val protobufDec = new ProtobufDecoder(RemoteRequestProtocol.getDefaultInstance)
+    val protobufDec = new ProtobufDecoder(ClientToServerProtocol.getDefaultInstance)
     val protobufEnc = new ProtobufEncoder
     val (enc,dec)   = RemoteServer.COMPRESSION_SCHEME match {
       case "zlib"  => (join(new ZlibEncoder(RemoteServer.ZLIB_COMPRESSION_LEVEL)), join(new ZlibDecoder))
       case       _ => (join(), join())
     }
 
-    val remoteServer = new RemoteServerHandler(name, openChannels, loader, actors, typedActors, server)
+    val remoteServer = new RemoteServerHandler(name, openChannels, loader, classCache, actors, typedActors, server)
     val stages = ssl ++ dec ++ join(lenDec, protobufDec) ++ enc ++ join(lenPrep, protobufEnc, remoteServer)
     new StaticChannelPipeline(stages: _*)
   }
@@ -393,10 +399,14 @@ class RemoteServerHandler(
     val name: String,
     val openChannels: ChannelGroup,
     val applicationLoader: Option[ClassLoader],
+    val classCache: Map[String, Future[Class[_]]],
     val actors: (() => ConcurrentHashMap[String, ActorRef]),
     val typedActors: (() => ConcurrentHashMap[String, AnyRef]),
     val server: RemoteServer) extends SimpleChannelUpstreamHandler with Logging {
   val AW_PROXY_PREFIX = "$$ProxiedByAW".intern
+
+  //Blocking map to store pass retrieved classes to waiting thread
+  val classBytesFutures = new ConcurrentHashMap[String, CompletableFuture[Option[ByteBuffer]]]()
 
   applicationLoader.foreach(MessageSerializer.setClassLoader(_))
 
@@ -441,8 +451,22 @@ class RemoteServerHandler(
   override def messageReceived(ctx: ChannelHandlerContext, event: MessageEvent) = {
     val message = event.getMessage
     if (message eq null) throw new IllegalActorStateException("Message in remote MessageEvent is null: " + event)
-    if (message.isInstanceOf[RemoteRequestProtocol]) {
-      handleRemoteRequestProtocol(message.asInstanceOf[RemoteRequestProtocol], event.getChannel)
+    if (message.isInstanceOf[ClientToServerProtocol]) {
+      val req = message.asInstanceOf[ClientToServerProtocol]
+      if(req.hasRemoteRequest)
+        handleRemoteRequestProtocol(req.getRemoteRequest, event.getChannel)
+      else if(req.hasClassResponse) {
+        val classResponse = req.getClassResponse
+        log.debug("Got class response for class %s", classResponse.getClassname)
+        val future = classBytesFutures.get(classResponse.getClassname)
+        if(future != null) {
+          future.completeWithResult(
+              if(classResponse.getFound) Some(classResponse.getClazz.asReadOnlyByteBuffer)
+              else None)
+        } else {
+          log.error("Gah! No future to complete with class data for class %s", classResponse.getClassname)
+        }
+      }
     }
   }
 
@@ -455,23 +479,29 @@ class RemoteServerHandler(
   private def handleRemoteRequestProtocol(request: RemoteRequestProtocol, channel: Channel) = {
     log.debug("Received RemoteRequestProtocol[\n%s]", request.toString)
     val actorType = request.getActorInfo.getActorType
-    if (actorType == SCALA_ACTOR) dispatchToActor(request, channel)
+
+    val remoteClassLoader = new RemoteClassLoader(applicationLoader.getOrElse(ClassLoader.getSystemClassLoader),
+                                               channel, classCache, classBytesFutures)
+
+    if (actorType == SCALA_ACTOR) spawn { dispatchToActor(request, channel, Some(remoteClassLoader)) }
     else if (actorType == JAVA_ACTOR)  throw new IllegalActorStateException("ActorType JAVA_ACTOR is currently not supported")
-    else if (actorType == TYPED_ACTOR) dispatchToTypedActor(request, channel)
+    else if (actorType == TYPED_ACTOR) spawn { dispatchToTypedActor(request, channel, Some(remoteClassLoader)) }
     else throw new IllegalActorStateException("Unknown ActorType [" + actorType + "]")
   }
 
-  private def dispatchToActor(request: RemoteRequestProtocol, channel: Channel) = {
+  private def dispatchToActor(request: RemoteRequestProtocol, channel: Channel, classLoader: Option[ClassLoader]) = {
     val actorInfo = request.getActorInfo
     log.debug("Dispatching to remote actor [%s:%s]", actorInfo.getTarget, actorInfo.getUuid)
 
-    val actorRef = createActor(actorInfo).start
+    val actorRef = createActor(actorInfo, classLoader).start
 
-    val message = MessageSerializer.deserialize(request.getMessage)
+    val message = MessageSerializer.deserialize(request.getMessage, classLoader)
     val sender =
-      if (request.hasSender) Some(RemoteActorSerialization.fromProtobufToRemoteActorRef(request.getSender, applicationLoader))
+      if (request.hasSender) Some(RemoteActorSerialization.fromProtobufToRemoteActorRef(request.getSender, classLoader))
       else None
 
+    log.debug("Sender identified: %s", sender.foreach(_.getHomeAddress))
+      
     message match { // first match on system messages
       case RemoteActorSystemMessage.Stop => actorRef.stop
       case _ =>     // then match on user defined messages
@@ -489,7 +519,7 @@ class RemoteServerHandler(
                 .setIsActor(true)
 
             if (request.hasSupervisorUuid) replyBuilder.setSupervisorUuid(request.getSupervisorUuid)
-            channel.write(replyBuilder.build)
+            channel.write(ServerToClientProtocol.newBuilder.setRemoteReply(replyBuilder).build)
 
           } catch {
             case e: Throwable =>
@@ -500,13 +530,13 @@ class RemoteServerHandler(
     }
   }
 
-  private def dispatchToTypedActor(request: RemoteRequestProtocol, channel: Channel) = {
+  private def dispatchToTypedActor(request: RemoteRequestProtocol, channel: Channel, classLoader: Option[ClassLoader]) = {
     val actorInfo = request.getActorInfo
     val typedActorInfo = actorInfo.getTypedActorInfo
     log.debug("Dispatching to remote typed actor [%s :: %s]", typedActorInfo.getMethod, typedActorInfo.getInterface)
-    val typedActor = createTypedActor(actorInfo)
+    val typedActor = createTypedActor(actorInfo, classLoader)
 
-    val args = MessageSerializer.deserialize(request.getMessage).asInstanceOf[Array[AnyRef]].toList
+    val args = MessageSerializer.deserialize(request.getMessage, classLoader).asInstanceOf[Array[AnyRef]].toList
     val argClasses = args.map(_.getClass)
 
     try {
@@ -521,7 +551,7 @@ class RemoteServerHandler(
             .setIsSuccessful(true)
             .setIsActor(false)
         if (request.hasSupervisorUuid) replyBuilder.setSupervisorUuid(request.getSupervisorUuid)
-        channel.write(replyBuilder.build)
+        channel.write(ServerToClientProtocol.newBuilder.setRemoteReply(replyBuilder))
       }
     } catch {
       case e: InvocationTargetException =>
@@ -540,7 +570,7 @@ class RemoteServerHandler(
    *
    * Does not start the actor.
    */
-  private def createActor(actorInfo: ActorInfoProtocol): ActorRef = {
+  private def createActor(actorInfo: ActorInfoProtocol, classLoader: Option[ClassLoader]): ActorRef = {
     val uuid = actorInfo.getUuid
     val name = actorInfo.getTarget
     val timeout = actorInfo.getTimeout
@@ -551,7 +581,7 @@ class RemoteServerHandler(
     if (actorRefOrNull eq null) {
       try {
         log.info("Creating a new remote actor [%s:%s]", name, uuid)
-        val clazz = if (applicationLoader.isDefined) applicationLoader.get.loadClass(name)
+        val clazz = if (classLoader.isDefined) classLoader.get.loadClass(name)
                     else Class.forName(name)
         val actorRef = Actor.actorOf(clazz.newInstance.asInstanceOf[Actor])
         actorRef.uuid = uuid
@@ -568,7 +598,7 @@ class RemoteServerHandler(
     } else actorRefOrNull
   }
 
-  private def createTypedActor(actorInfo: ActorInfoProtocol): AnyRef = {
+  private def createTypedActor(actorInfo: ActorInfoProtocol, classLoader: Option[ClassLoader]): AnyRef = {
     val uuid = actorInfo.getUuid
     val registeredTypedActors = typedActors()
     val typedActorOrNull = registeredTypedActors get uuid
@@ -582,8 +612,8 @@ class RemoteServerHandler(
         log.info("Creating a new remote typed actor:\n\t[%s :: %s]", interfaceClassname, targetClassname)
 
         val (interfaceClass, targetClass) =
-          if (applicationLoader.isDefined) (applicationLoader.get.loadClass(interfaceClassname),
-                                            applicationLoader.get.loadClass(targetClassname))
+          if (classLoader.isDefined) (classLoader.get.loadClass(interfaceClassname),
+                                            classLoader.get.loadClass(targetClassname))
           else (Class.forName(interfaceClassname), Class.forName(targetClassname))
 
         val newInstance = TypedActor.newInstance(
@@ -609,5 +639,47 @@ class RemoteServerHandler(
         .setIsActor(isActor)
     if (request.hasSupervisorUuid) replyBuilder.setSupervisorUuid(request.getSupervisorUuid)
     replyBuilder.build
+  }
+}
+
+class RemoteClassLoader(parent: ClassLoader, channel: Channel,
+                        classCache: Map[String, Future[Class[_]]],
+                        classBytesFutures: ConcurrentHashMap[String, CompletableFuture[Option[ByteBuffer]]]) extends ClassLoader(parent) {
+  override def findClass(name: String): Class[_] = {
+
+    val classFuture = classCache synchronized {
+      classCache.get(name) match {
+        case Some(future) =>
+          return future.await.result.getOrElse(throw new ClassNotFoundException("Class loading failed."))
+        case None =>
+          val f = new DefaultCompletableFuture[Class[_]](10000)
+          classCache += (name -> f)
+          f
+        }
+      }
+
+    val future = new DefaultCompletableFuture[Option[ByteBuffer]](10000)
+    classBytesFutures.put(name, future)
+
+    val classReq = ServerToClientProtocol.newBuilder.setClassRequest(
+            ClassRequestProtocol.newBuilder.setClassname(name))
+
+    log.debug("Send class request.")
+    channel.write(classReq.build)
+    log.debug("Wait for class %s against blocking map.", name)
+
+    future.await
+    classBytesFutures.remove(name)
+
+    future.result match {
+      case Some(Some(byteBuffer)) =>
+        log.debug("Class %s found.", name)
+        val clazz = defineClass(name, byteBuffer, null)
+        classFuture.completeWithResult(clazz)
+        return clazz
+      case _ =>
+        log.debug("Class data for %s not found.", name)
+        throw new ClassNotFoundException(name)
+    }
   }
 }
