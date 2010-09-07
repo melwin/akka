@@ -81,6 +81,8 @@ object RemoteServer {
     level
   }
 
+  val REMOTE_CLASS_LOADING = config.getBool("akka.remote.remote-class-loading", true)
+
   val SECURE = {
     /*if (config.getBool("akka.remote.ssl.service",false)) {
       val properties = List(
@@ -455,7 +457,7 @@ class RemoteServerHandler(
       val req = message.asInstanceOf[ClientToServerProtocol]
       if(req.hasRemoteRequest)
         handleRemoteRequestProtocol(req.getRemoteRequest, event.getChannel)
-      else if(req.hasClassResponse) {
+      else if(req.hasClassResponse && RemoteServer.REMOTE_CLASS_LOADING) {
         val classResponse = req.getClassResponse
         log.debug("Got class response for class %s", classResponse.getClassname)
         val future = classBytesFutures.get(classResponse.getClassname)
@@ -480,16 +482,22 @@ class RemoteServerHandler(
     log.debug("Received RemoteRequestProtocol[\n%s]", request.toString)
     val actorType = request.getActorInfo.getActorType
 
-    val remoteClassLoader = new RemoteClassLoader(applicationLoader.getOrElse(ClassLoader.getSystemClassLoader),
+    lazy val remoteClassLoader = new RemoteClassLoader(applicationLoader.getOrElse(ClassLoader.getSystemClassLoader),
                                                channel, classCache, classBytesFutures)
 
-    if (actorType == SCALA_ACTOR) spawn { dispatchToActor(request, channel, Some(remoteClassLoader)) }
-    else if (actorType == JAVA_ACTOR)  throw new IllegalActorStateException("ActorType JAVA_ACTOR is currently not supported")
-    else if (actorType == TYPED_ACTOR) spawn { dispatchToTypedActor(request, channel, Some(remoteClassLoader)) }
-    else throw new IllegalActorStateException("Unknown ActorType [" + actorType + "]")
+    actorType match {
+      case SCALA_ACTOR =>
+        if(RemoteServer.REMOTE_CLASS_LOADING) spawn { dispatchToActor(request, channel, Some(remoteClassLoader)) }
+        else dispatchToActor(request, channel)
+      case TYPED_ACTOR =>
+       if(RemoteServer.REMOTE_CLASS_LOADING) spawn { dispatchToTypedActor(request, channel, Some(remoteClassLoader)) }
+        else dispatchToTypedActor(request, channel)
+      case JAVA_ACTOR =>  throw new IllegalActorStateException("ActorType JAVA_ACTOR is currently not supported")
+      case _ => throw new IllegalActorStateException("Unknown ActorType [" + actorType + "]")
+    }
   }
 
-  private def dispatchToActor(request: RemoteRequestProtocol, channel: Channel, classLoader: Option[ClassLoader]) = {
+  private def dispatchToActor(request: RemoteRequestProtocol, channel: Channel, classLoader: Option[ClassLoader] = None) = {
     val actorInfo = request.getActorInfo
     log.debug("Dispatching to remote actor [%s:%s]", actorInfo.getTarget, actorInfo.getUuid)
 
@@ -530,7 +538,7 @@ class RemoteServerHandler(
     }
   }
 
-  private def dispatchToTypedActor(request: RemoteRequestProtocol, channel: Channel, classLoader: Option[ClassLoader]) = {
+  private def dispatchToTypedActor(request: RemoteRequestProtocol, channel: Channel, classLoader: Option[ClassLoader] = None) = {
     val actorInfo = request.getActorInfo
     val typedActorInfo = actorInfo.getTypedActorInfo
     log.debug("Dispatching to remote typed actor [%s :: %s]", typedActorInfo.getMethod, typedActorInfo.getInterface)
