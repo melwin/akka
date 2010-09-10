@@ -482,7 +482,7 @@ class RemoteServerHandler(
     log.debug("Received RemoteRequestProtocol[\n%s]", request.toString)
     val actorType = request.getActorInfo.getActorType
 
-    lazy val remoteClassLoader = new RemoteClassLoader(applicationLoader.getOrElse(ClassLoader.getSystemClassLoader),
+    lazy val remoteClassLoader = new RemoteClassLoader(applicationLoader.getOrElse(this.getClass.getClassLoader),
                                                channel, classCache, classBytesFutures)
 
     actorType match {
